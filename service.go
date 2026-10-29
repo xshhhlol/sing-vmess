@@ -4,15 +4,14 @@ import (
 	"bytes"
 	"context"
 	"crypto/aes"
-	"crypto/cipher"
 	"crypto/hmac"
 	"crypto/md5"
 	"crypto/sha256"
 	"encoding/binary"
-	"hash/crc32"
 	"io"
-	"math"
 	"net"
+	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -43,23 +42,31 @@ var (
 )
 
 type Service[U comparable] struct {
-	userKey              map[U][16]byte
-	userIdCipher         map[U]cipher.Block
+	users                atomic.Pointer[userTable[U]]
+	sources              *sourceCache
+	cacheClock           func() int64
 	replayFilter         replay.Filter
 	handler              Handler
 	time                 func() time.Time
 	disableHeaderProtect bool
-	alterIds             map[U][][16]byte
+	legacyAccess         sync.Mutex
+	alterIds             map[U]legacyUser
 	alterIdUpdateTime    map[U]int64
-	alterIdMap           map[[16]byte]legacyUserEntry[U]
+	alterIdMap           atomic.Pointer[map[[16]byte]legacyUserEntry[U]]
 	alterIdUpdateTask    *time.Ticker
 	alterIdUpdateDone    chan struct{}
 }
 
+type legacyUser struct {
+	cmdKey [16]byte
+	ids    [][16]byte
+}
+
 type legacyUserEntry[U comparable] struct {
-	User  U
-	Time  int64
-	Index int
+	User   U
+	CmdKey [16]byte
+	Time   int64
+	Index  int
 }
 
 func NewService[U comparable](handler Handler, options ...ServiceOption) *Service[U] {
@@ -67,6 +74,10 @@ func NewService[U comparable](handler Handler, options ...ServiceOption) *Servic
 		replayFilter: replay.NewSimple(time.Second * 120),
 		handler:      handler,
 		time:         time.Now,
+		sources:      newSourceCache(defaultScanFailureBurst, defaultScanFailureRate),
+		cacheClock: func() int64 {
+			return time.Now().UnixNano()
+		},
 	}
 	anyService := (*Service[string])(unsafe.Pointer(service))
 	for _, option := range options {
@@ -76,9 +87,12 @@ func NewService[U comparable](handler Handler, options ...ServiceOption) *Servic
 }
 
 func (s *Service[U]) UpdateUsers(userList []U, userIdList []string, alterIdList []int) error {
-	userKeyMap := make(map[U][16]byte)
-	userIdCipherMap := make(map[U]cipher.Block)
-	userAlterIds := make(map[U][][16]byte)
+	previous := s.users.Load()
+	table := &userTable[U]{
+		entries: make([]userEntry[U], 0, len(userList)),
+		byHint:  make(map[uint64]int, len(userList)),
+	}
+	userAlterIds := make(map[U]legacyUser)
 	for i, user := range userList {
 		userId := userIdList[i]
 		userUUID, err := uuid.FromString(userId)
@@ -86,12 +100,21 @@ func (s *Service[U]) UpdateUsers(userList []U, userIdList []string, alterIdList 
 			userUUID = uuid.NewV5(uuid.Nil, userId)
 		}
 		userCmdKey := Key(userUUID)
-		userKeyMap[user] = userCmdKey
-		userIdCipher, err := aes.NewCipher(KDF(userCmdKey[:], KDFSaltConstAuthIDEncryptionKey)[:16])
-		if err != nil {
-			return err
+		entry := userEntry[U]{user: user, cmdKey: userCmdKey}
+		// Reuse the AuthID cipher of unchanged users, deriving it is the costly part.
+		if previous != nil {
+			if j, loaded := previous.byHint[keyHint(userCmdKey)]; loaded && previous.entries[j].cmdKey == userCmdKey {
+				entry.block = previous.entries[j].block
+			}
 		}
-		userIdCipherMap[user] = userIdCipher
+		if entry.block == nil {
+			entry.block, err = aes.NewCipher(KDF(userCmdKey[:], KDFSaltConstAuthIDEncryptionKey)[:16])
+			if err != nil {
+				return err
+			}
+		}
+		table.byHint[keyHint(userCmdKey)] = len(table.entries)
+		table.entries = append(table.entries, entry)
 		alterId := alterIdList[i]
 		if alterId > 0 {
 			alterIds := make([][16]byte, 0, alterId)
@@ -100,20 +123,22 @@ func (s *Service[U]) UpdateUsers(userList []U, userIdList []string, alterIdList 
 				currentId = AlterId(currentId)
 				alterIds = append(alterIds, currentId)
 			}
-			userAlterIds[user] = alterIds
+			userAlterIds[user] = legacyUser{userCmdKey, alterIds}
 		}
 	}
-	s.userKey = userKeyMap
-	s.userIdCipher = userIdCipherMap
+	table.legacy = len(userAlterIds) > 0
+	s.legacyAccess.Lock()
 	s.alterIds = userAlterIds
 	s.alterIdUpdateTime = make(map[U]int64)
 	s.generateLegacyKeys()
+	s.legacyAccess.Unlock()
+	s.users.Store(table)
 	return nil
 }
 
 func (s *Service[U]) Start() error {
 	const updateInterval = 10 * time.Second
-	if len(s.alterIds) > 0 {
+	if table := s.users.Load(); table != nil && table.legacy {
 		s.alterIdUpdateTask = time.NewTicker(updateInterval)
 		s.alterIdUpdateDone = make(chan struct{})
 		go s.loopGenerateLegacyKeys()
@@ -136,10 +161,13 @@ func (s *Service[U]) loopGenerateLegacyKeys() {
 			return
 		case <-s.alterIdUpdateTask.C:
 		}
+		s.legacyAccess.Lock()
 		s.generateLegacyKeys()
+		s.legacyAccess.Unlock()
 	}
 }
 
+// generateLegacyKeys must be called with legacyAccess held.
 func (s *Service[U]) generateLegacyKeys() {
 	nowSec := s.time().Unix()
 	endSec := nowSec + CacheDurationSeconds
@@ -148,31 +176,32 @@ func (s *Service[U]) generateLegacyKeys() {
 	userAlterIdMap := make(map[[16]byte]legacyUserEntry[U])
 	userAlterIdUpdateTime := make(map[U]int64)
 
-	for user, alterIds := range s.alterIds {
+	for user, legacy := range s.alterIds {
 		beginSec := s.alterIdUpdateTime[user]
 		if beginSec < nowSec-CacheDurationSeconds {
 			beginSec = nowSec - CacheDurationSeconds
 		}
-		for i, alterId := range alterIds {
+		for i, alterId := range legacy.ids {
 			idHash := hmac.New(md5.New, alterId[:])
 			for ts := beginSec; ts <= endSec; ts++ {
 				common.Must(binary.Write(idHash, binary.BigEndian, uint64(ts)))
 				idHash.Sum(hashValue[:0])
 				idHash.Reset()
-				userAlterIdMap[hashValue] = legacyUserEntry[U]{user, ts, i}
+				userAlterIdMap[hashValue] = legacyUserEntry[U]{user, legacy.cmdKey, ts, i}
 			}
 		}
 		userAlterIdUpdateTime[user] = nowSec
 	}
 	s.alterIdUpdateTime = userAlterIdUpdateTime
-	s.alterIdMap = userAlterIdMap
+	s.alterIdMap.Store(&userAlterIdMap)
 }
 
 func (s *Service[U]) NewConnection(ctx context.Context, conn net.Conn, source M.Socksaddr, onClose N.CloseHandlerFunc) error {
 	const headerLenBufferLen = 2 + CipherOverhead
 	const aeadMinHeaderLen = 16 + headerLenBufferLen + 8 + CipherOverhead + 42
+	table := s.users.Load()
 	minHeaderLen := aeadMinHeaderLen
-	if len(s.alterIds) > 0 {
+	if table != nil && table.legacy {
 		minHeaderLen = 16 + 38
 	}
 
@@ -195,35 +224,35 @@ func (s *Service[U]) NewConnection(ctx context.Context, conn net.Conn, source M.
 	}
 
 	authId := requestBuffer.To(16)
-	var decodedId [16]byte
 	var user U
+	var cmdKey [16]byte
 	var found bool
-	for currUser, userIdBlock := range s.userIdCipher {
-		userIdBlock.Decrypt(decodedId[:], authId)
-		timestamp := int64(binary.BigEndian.Uint64(decodedId[:]))
-		checksum := binary.BigEndian.Uint32(decodedId[12:])
-		if crc32.ChecksumIEEE(decodedId[:12]) != checksum {
-			continue
+	if table != nil {
+		entry, decodedId := s.matchAuthID(table, authId, source.Addr, s.cacheClock())
+		if entry != nil {
+			timestamp := int64(binary.BigEndian.Uint64(decodedId[:]))
+			if diff := timestamp - s.time().Unix(); diff > 120 || diff < -120 {
+				return ErrBadTimestamp
+			}
+			if !s.replayFilter.Check(decodedId[:]) {
+				return ErrReplay
+			}
+			user = entry.user
+			cmdKey = entry.cmdKey
+			found = true
 		}
-		if math.Abs(math.Abs(float64(timestamp))-float64(time.Now().Unix())) > 120 {
-			return ErrBadTimestamp
-		}
-		if !s.replayFilter.Check(decodedId[:]) {
-			return ErrReplay
-		}
-		user = currUser
-		found = true
-		break
 	}
 
 	var legacyProtocol bool
 	var legacyTimestamp uint64
-	if !found {
-		copy(decodedId[:], authId)
-		if currUser, loaded := s.alterIdMap[decodedId]; loaded {
+	if !found && table != nil && table.legacy {
+		var legacyId [16]byte
+		copy(legacyId[:], authId)
+		if currUser, loaded := (*s.alterIdMap.Load())[legacyId]; loaded {
 			found = true
 			legacyProtocol = true
 			user = currUser.User
+			cmdKey = currUser.CmdKey
 			legacyTimestamp = uint64(currUser.Time)
 		}
 	}
@@ -232,7 +261,6 @@ func (s *Service[U]) NewConnection(ctx context.Context, conn net.Conn, source M.
 	}
 
 	ctx = auth.ContextWithUser(ctx, user)
-	cmdKey := s.userKey[user]
 	var headerReader io.Reader
 	var headerBuffer []byte
 
@@ -247,8 +275,7 @@ func (s *Service[U]) NewConnection(ctx context.Context, conn net.Conn, source M.
 		common.Must(binary.Write(timeHash, binary.BigEndian, legacyTimestamp))
 		common.Must(binary.Write(timeHash, binary.BigEndian, legacyTimestamp))
 		common.Must(binary.Write(timeHash, binary.BigEndian, legacyTimestamp))
-		userKey := s.userKey[user]
-		headerReader = NewStreamReader(reader, userKey[:], timeHash.Sum(nil))
+		headerReader = NewStreamReader(reader, cmdKey[:], timeHash.Sum(nil))
 		headerBuffer = make([]byte, 38)
 		_, err = io.ReadFull(headerReader, headerBuffer)
 		if err != nil {
