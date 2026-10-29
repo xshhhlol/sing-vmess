@@ -45,6 +45,7 @@ func (e *userEntry[U]) decodeAuthID(dst *[16]byte, authID []byte) bool {
 type userTable[U comparable] struct {
 	entries []userEntry[U]
 	byHint  map[uint64]int
+	byUser  map[U]struct{}
 	legacy  bool
 }
 

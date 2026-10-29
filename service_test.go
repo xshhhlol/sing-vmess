@@ -265,6 +265,9 @@ func TestServiceUpdateUsers(t *testing.T) {
 	client, _ = NewClient(ids[30], "auto", 0)
 	echoTCP(t, server, client, 29)
 
+	if server.service.Contains(49) || !server.service.Contains(48) {
+		t.Fatal("Contains does not follow the user list")
+	}
 	removed, _ := NewClient(ids[10], "auto", 0)
 	conn := removed.DialEarlyConn(server.dial(t), M.ParseSocksaddr("example.com:443"))
 	conn.Write([]byte("hello"))

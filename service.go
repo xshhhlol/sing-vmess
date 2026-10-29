@@ -113,6 +113,7 @@ func (s *Service[U]) UpdateUsers(userList []U, userIdList []string, alterIdList 
 	table := &userTable[U]{
 		entries: make([]userEntry[U], 0, len(userList)),
 		byHint:  make(map[uint64]int, len(userList)),
+		byUser:  make(map[U]struct{}, len(userList)),
 	}
 	userAlterIds := make(map[U]legacyUser)
 	for i, user := range userList {
@@ -136,6 +137,7 @@ func (s *Service[U]) UpdateUsers(userList []U, userIdList []string, alterIdList 
 			}
 		}
 		table.byHint[keyHint(userCmdKey)] = len(table.entries)
+		table.byUser[user] = struct{}{}
 		table.entries = append(table.entries, entry)
 		alterId := alterIdList[i]
 		if alterId > 0 {
@@ -156,6 +158,18 @@ func (s *Service[U]) UpdateUsers(userList []U, userIdList []string, alterIdList 
 	s.legacyAccess.Unlock()
 	s.users.Store(table)
 	return nil
+}
+
+// Contains reports whether user is in the current user list. A caller that
+// closes the connections of deleted users after UpdateUsers can check this
+// once a connection is tracked, so none slips through in between.
+func (s *Service[U]) Contains(user U) bool {
+	table := s.users.Load()
+	if table == nil {
+		return false
+	}
+	_, loaded := table.byUser[user]
+	return loaded
 }
 
 func (s *Service[U]) Start() error {
