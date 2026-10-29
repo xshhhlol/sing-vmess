@@ -438,3 +438,51 @@ func TestResponseShapingRandomSizes(t *testing.T) {
 		t.Fatalf("got %d writes %v, want 8 to 16 shaped records and the rest", len(writes), writes)
 	}
 }
+
+// asyncFallback reads after NewConnectionEx returns, as sing-box routing does.
+type asyncFallback struct {
+	results chan []byte
+}
+
+func (f *asyncFallback) NewConnectionEx(ctx context.Context, conn net.Conn, source M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
+	go func() {
+		defer conn.Close()
+		time.Sleep(20 * time.Millisecond)
+		cached := conn.(*bufio.CachedConn).ReadCached()
+		data := append([]byte(nil), cached.Bytes()...)
+		cached.Release()
+		f.results <- data
+	}()
+}
+
+// The replayed bytes must survive NewConnection returning: the fallback owns
+// the buffer, which must not go back to the pool under it.
+func TestAsyncFallbackKeepsReplayedBytes(t *testing.T) {
+	fallback := &asyncFallback{results: make(chan []byte, 32)}
+	server := newProbeServer(t, &echoHandler{users: make(chan int, 1)}, ServiceWithFallback(fallback))
+	users, ids, alterIds := testUsers(5)
+	server.service.UpdateUsers(users, ids, alterIds)
+	probes := make([][]byte, 16)
+	for i := range probes {
+		probes[i] = randomBytes(200 + i)
+		conn, _ := server.dial(t)
+		conn.Write(probes[i])
+	}
+	seen := 0
+	for range probes {
+		select {
+		case data := <-fallback.results:
+			for _, p := range probes {
+				if bytes.Equal(data, p) {
+					seen++
+					break
+				}
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("fallback not reached")
+		}
+	}
+	if seen != len(probes) {
+		t.Fatalf("%d of %d replays intact", seen, len(probes))
+	}
+}

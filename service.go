@@ -239,8 +239,8 @@ func (s *Service[U]) generateLegacyKeys() {
 // keys, replays, stale timestamps or malformed headers apart, and the reply
 // never depends on how many bytes it sent.
 func (s *Service[U]) NewConnection(ctx context.Context, conn net.Conn, source M.Socksaddr, onClose N.CloseHandlerFunc) error {
+	// Not deferred: on rejection the buffer may be handed to the fallback.
 	requestBuffer := buf.New()
-	defer requestBuffer.Release()
 
 	deadline := time.Now().Add(s.handshakeTimeout)
 	if contextDeadline, loaded := ctx.Deadline(); loaded && contextDeadline.Before(deadline) {
@@ -259,6 +259,8 @@ func (s *Service[U]) NewConnection(ctx context.Context, conn net.Conn, source M.
 		requestBuffer.Resize(0, requestBuffer.Start()+requestBuffer.Len())
 		return s.reject(ctx, conn, source, requestBuffer, deadline, err, onClose)
 	}
+	// handshake copied what the request reader still needs.
+	requestBuffer.Release()
 
 	switch request.command {
 	case CommandTCP:
@@ -487,9 +489,14 @@ func (s *Service[U]) reject(ctx context.Context, conn net.Conn, source M.Socksad
 		if E.IsTimeout(err) {
 			fallbackConn = &readEndedConn{Conn: conn}
 		}
-		s.fallbackHandler.NewConnectionEx(ctx, bufio.NewCachedConn(fallbackConn, request), source, M.Socksaddr{}, onClose)
+		// The cached connection owns a reference until drained or closed, so
+		// this release is a no-op; the handler may read it after we return.
+		cachedConn := bufio.NewCachedConn(fallbackConn, request)
+		request.Release()
+		s.fallbackHandler.NewConnectionEx(ctx, cachedConn, source, M.Socksaddr{}, onClose)
 		return nil
 	}
+	request.Release()
 	s.drain(conn, deadline)
 	return err
 }
