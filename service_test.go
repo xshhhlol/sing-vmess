@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -65,6 +66,8 @@ func testUsers(n int) ([]int, []string, []int) {
 	return users, ids, alterIds
 }
 
+const testHandshakeTimeout = 500 * time.Millisecond
+
 type testServer struct {
 	service  *Service[int]
 	handler  *echoHandler
@@ -80,7 +83,7 @@ func newTestServer(t *testing.T, options ...ServiceOption) *testServer {
 		t.Fatal(err)
 	}
 	server := &testServer{
-		service:  NewService[int](handler, options...),
+		service:  NewService[int](handler, append([]ServiceOption{ServiceWithHandshakeTimeout(testHandshakeTimeout)}, options...)...),
 		handler:  handler,
 		listener: listener,
 		errors:   make(chan error, 16),
@@ -134,7 +137,7 @@ func (s *testServer) expectError(t *testing.T, want error) {
 	case user := <-s.handler.users:
 		t.Fatalf("authenticated as user %d, want %v", user, want)
 	case err := <-s.errors:
-		if err != want {
+		if !errors.Is(err, want) {
 			t.Fatalf("got error %v, want %v", err, want)
 		}
 	case <-time.After(5 * time.Second):
@@ -146,8 +149,7 @@ func echoTCP(t *testing.T, server *testServer, client *Client, user int) {
 	t.Helper()
 	conn := client.DialEarlyConn(server.dial(t), M.ParseSocksaddr("example.com:443"))
 	payload := []byte("hello vmess " + fmt.Sprint(user))
-	// The aes-128-cfb client encrypts the slice passed to Write in place.
-	if _, err := conn.Write(append([]byte(nil), payload...)); err != nil {
+	if _, err := conn.Write(payload); err != nil {
 		t.Fatal(err)
 	}
 	server.expectUser(t, user)
@@ -184,7 +186,7 @@ func TestServiceClientCompatibility(t *testing.T) {
 
 				packetConn := client.DialEarlyPacketConn(server.dial(t), M.ParseSocksaddr("1.1.1.1:53"))
 				payload := []byte("udp payload")
-				if _, err := packetConn.WriteTo(append([]byte(nil), payload...), M.ParseSocksaddr("1.1.1.1:53").UDPAddr()); err != nil {
+				if _, err := packetConn.WriteTo(payload, M.ParseSocksaddr("1.1.1.1:53").UDPAddr()); err != nil {
 					t.Fatal(err)
 				}
 				server.expectUser(t, user)

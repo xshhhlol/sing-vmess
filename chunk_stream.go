@@ -55,9 +55,12 @@ func NewStreamWriter(upstream io.Writer, key []byte, iv []byte) *StreamWriter {
 	}
 }
 
+// Write encrypts into its own buffer: an io.Writer must not modify p.
 func (w *StreamWriter) Write(p []byte) (n int, err error) {
-	w.cipher.XORKeyStream(p, p)
-	return w.upstream.Write(p)
+	buffer := buf.NewSize(len(p))
+	defer buffer.Release()
+	w.cipher.XORKeyStream(buffer.Extend(len(p)), p)
+	return w.upstream.Write(buffer.Bytes())
 }
 
 func (w *StreamWriter) WriteBuffer(buffer *buf.Buffer) error {

@@ -49,6 +49,11 @@ type Service[U comparable] struct {
 	handler              Handler
 	time                 func() time.Time
 	disableHeaderProtect bool
+	handshakeTimeout     time.Duration
+	fallbackHandler      N.TCPConnectionHandlerEx
+	requireEncryption    bool
+	responseShaping      *ResponseShapingOptions
+	drainCount           atomic.Int32
 	legacyAccess         sync.Mutex
 	alterIds             map[U]legacyUser
 	alterIdUpdateTime    map[U]int64
@@ -69,12 +74,23 @@ type legacyUserEntry[U comparable] struct {
 	Index  int
 }
 
+const (
+	// DefaultHandshakeTimeout bounds reading the request header.
+	DefaultHandshakeTimeout = 10 * time.Second
+	// DefaultFallbackHandshakeTimeout is the header budget with a web
+	// fallback, matching the trojan inbound and the built-in V2bX site.
+	DefaultFallbackHandshakeTimeout = 30 * time.Second
+
+	maxDrainingConnections = 4096
+)
+
 func NewService[U comparable](handler Handler, options ...ServiceOption) *Service[U] {
 	service := &Service[U]{
-		replayFilter: replay.NewSimple(time.Second * 120),
-		handler:      handler,
-		time:         time.Now,
-		sources:      newSourceCache(defaultScanFailureBurst, defaultScanFailureRate),
+		replayFilter:     replay.NewSimple(time.Second * 120),
+		handler:          handler,
+		time:             time.Now,
+		handshakeTimeout: -1,
+		sources:          newSourceCache(defaultScanFailureBurst, defaultScanFailureRate),
 		cacheClock: func() int64 {
 			return time.Now().UnixNano()
 		},
@@ -82,6 +98,12 @@ func NewService[U comparable](handler Handler, options ...ServiceOption) *Servic
 	anyService := (*Service[string])(unsafe.Pointer(service))
 	for _, option := range options {
 		option(anyService)
+	}
+	if service.handshakeTimeout < 0 {
+		service.handshakeTimeout = DefaultHandshakeTimeout
+		if service.fallbackHandler != nil {
+			service.handshakeTimeout = DefaultFallbackHandshakeTimeout
+		}
 	}
 	return service
 }
@@ -196,7 +218,55 @@ func (s *Service[U]) generateLegacyKeys() {
 	s.alterIdMap.Store(&userAlterIdMap)
 }
 
+// NewConnection authenticates conn. Every request it cannot serve, for any
+// reason, gets the same treatment: the bytes read so far are replayed to the
+// fallback handler, or without one the connection is drained until the peer
+// closes or the handshake deadline passes. A prober therefore cannot tell bad
+// keys, replays, stale timestamps or malformed headers apart, and the reply
+// never depends on how many bytes it sent.
 func (s *Service[U]) NewConnection(ctx context.Context, conn net.Conn, source M.Socksaddr, onClose N.CloseHandlerFunc) error {
+	requestBuffer := buf.New()
+	defer requestBuffer.Release()
+
+	deadline := time.Now().Add(s.handshakeTimeout)
+	if contextDeadline, loaded := ctx.Deadline(); loaded && contextDeadline.Before(deadline) {
+		deadline = contextDeadline
+	}
+	// A transport that cannot set deadlines keeps working, only unbounded.
+	hasDeadline := conn.SetReadDeadline(deadline) == nil
+
+	ctx, request, err := s.handshake(ctx, conn, source, requestBuffer)
+	if hasDeadline {
+		if clearErr := conn.SetReadDeadline(time.Time{}); clearErr != nil && err == nil {
+			err = E.Cause(clearErr, "clear handshake deadline")
+		}
+	}
+	if err != nil {
+		requestBuffer.Resize(0, requestBuffer.Start()+requestBuffer.Len())
+		return s.reject(ctx, conn, source, requestBuffer, deadline, err, onClose)
+	}
+
+	switch request.command {
+	case CommandTCP:
+		request.conn.shaper = newResponseShaper(s.responseShaping)
+		s.handler.NewConnectionEx(ctx, &serverConn{request.conn}, source, request.destination, onClose)
+	case CommandUDP:
+		s.handler.NewPacketConnectionEx(ctx, &serverPacketConn{request.conn, request.destination}, source, request.destination, onClose)
+	case CommandMux:
+		return HandleMuxConnection(ctx, &serverConn{request.conn}, source, s.handler)
+	}
+	return nil
+}
+
+type serverRequest struct {
+	conn        rawServerConn
+	command     byte
+	destination M.Socksaddr
+}
+
+// handshake reads and checks the request header. Every byte read stays in
+// requestBuffer, so on error it can be rewound and replayed.
+func (s *Service[U]) handshake(ctx context.Context, conn net.Conn, source M.Socksaddr, requestBuffer *buf.Buffer) (context.Context, *serverRequest, error) {
 	const headerLenBufferLen = 2 + CipherOverhead
 	const aeadMinHeaderLen = 16 + headerLenBufferLen + 8 + CipherOverhead + 42
 	table := s.users.Load()
@@ -205,21 +275,18 @@ func (s *Service[U]) NewConnection(ctx context.Context, conn net.Conn, source M.
 		minHeaderLen = 16 + 38
 	}
 
-	requestBuffer := buf.New()
-	defer requestBuffer.Release()
-
 	if !s.disableHeaderProtect {
 		n, err := requestBuffer.ReadOnceFrom(conn)
 		if err != nil {
-			return err
+			return ctx, nil, err
 		}
 		if n < minHeaderLen {
-			return ErrBadHeader
+			return ctx, nil, ErrBadHeader
 		}
 	} else {
 		_, err := requestBuffer.ReadAtLeastFrom(conn, minHeaderLen)
 		if err != nil {
-			return err
+			return ctx, nil, err
 		}
 	}
 
@@ -232,10 +299,10 @@ func (s *Service[U]) NewConnection(ctx context.Context, conn net.Conn, source M.
 		if entry != nil {
 			timestamp := int64(binary.BigEndian.Uint64(decodedId[:]))
 			if diff := timestamp - s.time().Unix(); diff > 120 || diff < -120 {
-				return ErrBadTimestamp
+				return ctx, nil, ErrBadTimestamp
 			}
 			if !s.replayFilter.Check(decodedId[:]) {
-				return ErrReplay
+				return ctx, nil, ErrReplay
 			}
 			user = entry.user
 			cmdKey = entry.cmdKey
@@ -257,7 +324,7 @@ func (s *Service[U]) NewConnection(ctx context.Context, conn net.Conn, source M.
 		}
 	}
 	if !found {
-		return ErrBadRequest
+		return ctx, nil, ErrBadRequest
 	}
 
 	ctx = auth.ContextWithUser(ctx, user)
@@ -279,11 +346,11 @@ func (s *Service[U]) NewConnection(ctx context.Context, conn net.Conn, source M.
 		headerBuffer = make([]byte, 38)
 		_, err = io.ReadFull(headerReader, headerBuffer)
 		if err != nil {
-			return E.Extend(ErrBadHeader, io.ErrShortBuffer)
+			return ctx, nil, E.Extend(ErrBadHeader, io.ErrShortBuffer)
 		}
 	} else {
 		if requestBuffer.Len() < aeadMinHeaderLen {
-			return ErrBadHeader
+			return ctx, nil, ErrBadHeader
 		}
 
 		reader = conn
@@ -293,9 +360,10 @@ func (s *Service[U]) NewConnection(ctx context.Context, conn net.Conn, source M.
 
 		lengthKey := KDF(cmdKey[:], KDFSaltConstVMessHeaderPayloadLengthAEADKey, authId, connectionNonce)[:16]
 		lengthNonce := KDF(cmdKey[:], KDFSaltConstVMessHeaderPayloadLengthAEADIV, authId, connectionNonce)[:12]
-		lengthBuffer, err := newAesGcm(lengthKey).Open(requestBuffer.Index(16), lengthNonce, requestBuffer.Range(16, nonceIndex), authId)
+		// Decrypt out of place: on failure the request is replayed unmodified.
+		lengthBuffer, err := newAesGcm(lengthKey).Open(nil, lengthNonce, requestBuffer.Range(16, nonceIndex), authId)
 		if err != nil {
-			return err
+			return ctx, nil, err
 		}
 
 		const headerIndex = nonceIndex + 8
@@ -304,19 +372,19 @@ func (s *Service[U]) NewConnection(ctx context.Context, conn net.Conn, source M.
 		if needRead > 0 {
 			_, err = requestBuffer.ReadFullFrom(conn, needRead)
 			if err != nil {
-				return err
+				return ctx, nil, err
 			}
 		}
 
 		headerKey := KDF(cmdKey[:], KDFSaltConstVMessHeaderPayloadAEADKey, authId, connectionNonce)[:16]
 		headerNonce := KDF(cmdKey[:], KDFSaltConstVMessHeaderPayloadAEADIV, authId, connectionNonce)[:12]
-		headerBuffer, err = newAesGcm(headerKey).Open(requestBuffer.Index(headerIndex), headerNonce, requestBuffer.Range(headerIndex, headerIndex+headerLength+CipherOverhead), authId)
+		headerBuffer, err = newAesGcm(headerKey).Open(nil, headerNonce, requestBuffer.Range(headerIndex, headerIndex+headerLength+CipherOverhead), authId)
 		if err != nil {
-			return err
+			return ctx, nil, err
 		}
 		// replace with < if support mux
 		if len(headerBuffer) <= 38 {
-			return E.Extend(ErrBadHeader, io.ErrShortBuffer)
+			return ctx, nil, E.Extend(ErrBadHeader, io.ErrShortBuffer)
 		}
 		requestBuffer.Advance(headerIndex + headerLength + CipherOverhead)
 		headerReader = bytes.NewReader(headerBuffer[38:])
@@ -324,7 +392,7 @@ func (s *Service[U]) NewConnection(ctx context.Context, conn net.Conn, source M.
 
 	version := headerBuffer[0]
 	if version != Version {
-		return E.Extend(ErrBadVersion, version)
+		return ctx, nil, E.Extend(ErrBadVersion, version)
 	}
 
 	requestBodyKey := make([]byte, 16)
@@ -340,33 +408,33 @@ func (s *Service[U]) NewConnection(ctx context.Context, conn net.Conn, source M.
 	switch security {
 	case SecurityTypeNone, SecurityTypeLegacy, SecurityTypeAes128Gcm, SecurityTypeChacha20Poly1305:
 	default:
-		return E.New("unknown security type: ", security)
+		return ctx, nil, E.New("unknown security type: ", security)
 	}
 	command := headerBuffer[37]
 	switch command {
 	case CommandTCP, CommandUDP, CommandMux:
 	default:
-		return E.New("unknown command: ", command)
+		return ctx, nil, E.New("unknown command: ", command)
 	}
 	if command == CommandUDP && option == 0 {
-		return E.New("bad packet connection")
+		return ctx, nil, E.New("bad packet connection")
 	}
 	var destination M.Socksaddr
 	if command != CommandMux {
 		destination, err = AddressSerializer.ReadAddrPort(headerReader)
 		if err != nil {
-			return err
+			return ctx, nil, err
 		}
 	}
 	if paddingLen > 0 {
 		_, err = io.CopyN(io.Discard, headerReader, int64(paddingLen))
 		if err != nil {
-			return E.Extend(ErrBadHeader, "bad padding")
+			return ctx, nil, E.Extend(ErrBadHeader, "bad padding")
 		}
 	}
 	err = rw.SkipN(headerReader, 4)
 	if err != nil {
-		return err
+		return ctx, nil, err
 	}
 	if !legacyProtocol && requestBuffer.Len() > 0 {
 		reader = bufio.NewCachedReader(reader, requestBuffer.ToOwned())
@@ -375,34 +443,68 @@ func (s *Service[U]) NewConnection(ctx context.Context, conn net.Conn, source M.
 	if option&RequestOptionChunkStream != 0 && command == CommandTCP || command == CommandMux {
 		reader = bufio.NewChunkReader(reader, ReadChunkSize)
 	}
-	rawConn := rawServerConn{
-		Conn:           conn,
-		legacyProtocol: legacyProtocol,
-		requestKey:     requestBodyKey,
-		requestNonce:   requestBodyNonce,
-		responseHeader: responseHeader,
-		security:       security,
-		option:         option,
-		reader:         bufio.NewExtendedReader(reader),
+	if s.requireEncryption && (security == SecurityTypeNone || security == SecurityTypeLegacy) {
+		return ctx, nil, E.New("unauthenticated security type rejected: ", security)
 	}
-
-	switch command {
-	case CommandTCP:
-		s.handler.NewConnectionEx(ctx, &serverConn{rawConn}, source, destination, onClose)
-	case CommandUDP:
-		s.handler.NewPacketConnectionEx(ctx, &serverPacketConn{rawConn, destination}, source, destination, onClose)
-	case CommandMux:
-		return HandleMuxConnection(ctx, &serverConn{rawConn}, source, s.handler)
-	default:
-		return E.New("unknown command: ", command)
-	}
-	return nil
+	out := &coalescedWriter{upstream: bufio.NewExtendedWriter(conn)}
+	return ctx, &serverRequest{
+		conn: rawServerConn{
+			Conn:           conn,
+			out:            out,
+			legacyProtocol: legacyProtocol,
+			requestKey:     requestBodyKey,
+			requestNonce:   requestBodyNonce,
+			responseHeader: responseHeader,
+			security:       security,
+			option:         option,
+			reader:         bufio.NewExtendedReader(reader),
+		},
+		command:     command,
+		destination: destination,
+	}, nil
 }
+
+func (s *Service[U]) reject(ctx context.Context, conn net.Conn, source M.Socksaddr, request *buf.Buffer, deadline time.Time, err error, onClose N.CloseHandlerFunc) error {
+	err = E.Cause(err, "bad request")
+	if s.fallbackHandler != nil {
+		fallbackConn := conn
+		// The header budget is spent: replay the bytes as a finished read so
+		// the fallback answers the incomplete request instead of waiting again.
+		if E.IsTimeout(err) {
+			fallbackConn = &readEndedConn{Conn: conn}
+		}
+		s.fallbackHandler.NewConnectionEx(ctx, bufio.NewCachedConn(fallbackConn, request), source, M.Socksaddr{}, onClose)
+		return nil
+	}
+	s.drain(conn, deadline)
+	return err
+}
+
+// drain reads and discards until the peer closes or deadline passes, like a
+// server still waiting for a complete request, instead of closing at once.
+func (s *Service[U]) drain(conn net.Conn, deadline time.Time) {
+	if s.drainCount.Add(1) <= maxDrainingConnections {
+		if conn.SetReadDeadline(deadline) == nil {
+			io.Copy(io.Discard, conn)
+		}
+	}
+	s.drainCount.Add(-1)
+}
+
+// Upstream preserves TLS/ALPN discovery through connection wrappers. Reads are
+// intentionally not replaceable: bypassing Read would restart the stalled input.
+type readEndedConn struct{ net.Conn }
+
+func (c *readEndedConn) Read([]byte) (int, error) { return 0, io.EOF }
+func (c *readEndedConn) Upstream() any            { return c.Conn }
+func (c *readEndedConn) ReaderReplaceable() bool  { return false }
 
 var _ N.EarlyWriter = (*rawServerConn)(nil)
 
 type rawServerConn struct {
 	net.Conn
+	out            *coalescedWriter
+	shaper         *responseShaper
 	legacyProtocol bool
 	requestKey     []byte
 	requestNonce   []byte
@@ -417,12 +519,13 @@ func (c *rawServerConn) writeResponse() error {
 	if c.legacyProtocol {
 		responseKey := md5.Sum(c.requestKey)
 		responseNonce := md5.Sum(c.requestNonce)
-		headerWriter := NewStreamWriter(c.Conn, responseKey[:], responseNonce[:])
+		c.out.hold()
+		headerWriter := NewStreamWriter(c.out, responseKey[:], responseNonce[:])
 		_, err := headerWriter.Write([]byte{c.responseHeader, c.option, 0, 0})
 		if err != nil {
 			return E.Cause(err, "write response")
 		}
-		c.writer = bufio.NewExtendedWriter(CreateWriter(c.Conn, headerWriter, c.requestKey, c.requestNonce, responseKey[:], responseNonce[:], c.security, c.option))
+		c.writer = bufio.NewExtendedWriter(CreateWriter(c.out, headerWriter, c.requestKey, c.requestNonce, responseKey[:], responseNonce[:], c.security, c.option))
 	} else {
 		responseBuffer := buf.NewSize(2 + CipherOverhead + 4 + CipherOverhead)
 		defer responseBuffer.Release()
@@ -451,12 +554,11 @@ func (c *rawServerConn) writeResponse() error {
 		headerCipher.Seal(responseBuffer.Index(headerIndex), headerNonce, responseBuffer.From(headerIndex), nil)
 		responseBuffer.Extend(CipherOverhead)
 
-		_, err := c.Conn.Write(responseBuffer.Bytes())
-		if err != nil {
-			return err
-		}
+		// Held until the first data, so it never travels as a fixed-size write.
+		c.out.hold()
+		common.Must1(c.out.Write(responseBuffer.Bytes()))
 
-		c.writer = bufio.NewExtendedWriter(CreateWriter(c.Conn, nil, c.requestKey, c.requestNonce, responseKey, responseNonce, c.security, c.option))
+		c.writer = bufio.NewExtendedWriter(CreateWriter(c.out, nil, c.requestKey, c.requestNonce, responseKey, responseNonce, c.security, c.option))
 	}
 	return nil
 }
@@ -500,43 +602,12 @@ func (c *serverConn) Read(b []byte) (n int, err error) {
 	return c.reader.Read(b)
 }
 
-func (c *serverConn) Write(b []byte) (n int, err error) {
-	if c.writer == nil {
-		err = c.writeResponse()
-		if err != nil {
-			return
-		}
-	}
-	return c.writer.Write(b)
-}
-
 func (c *serverConn) ReadBuffer(buffer *buf.Buffer) error {
 	return c.reader.ReadBuffer(buffer)
 }
 
-func (c *serverConn) WriteBuffer(buffer *buf.Buffer) error {
-	if c.writer == nil {
-		err := c.writeResponse()
-		if err != nil {
-			buffer.Release()
-			return err
-		}
-	}
-	return c.writer.WriteBuffer(buffer)
-}
-
 func (c *serverConn) WriteTo(w io.Writer) (n int64, err error) {
 	return bufio.Copy(w, c.reader)
-}
-
-func (c *serverConn) ReadFrom(r io.Reader) (n int64, err error) {
-	if c.writer == nil {
-		err = c.writeResponse()
-		if err != nil {
-			return
-		}
-	}
-	return bufio.Copy(c.writer, r)
 }
 
 var _ PacketConn = (*serverPacketConn)(nil)
@@ -555,16 +626,6 @@ func (c *serverPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) 
 	return
 }
 
-func (c *serverPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
-	if c.writer == nil {
-		err = c.writeResponse()
-		if err != nil {
-			return
-		}
-	}
-	return c.writer.Write(p)
-}
-
 func (c *serverPacketConn) ReadPacket(buffer *buf.Buffer) (destination M.Socksaddr, err error) {
 	err = c.reader.ReadBuffer(buffer)
 	if err != nil {
@@ -572,14 +633,4 @@ func (c *serverPacketConn) ReadPacket(buffer *buf.Buffer) (destination M.Socksad
 	}
 	destination = c.destination
 	return
-}
-
-func (c *serverPacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
-	if c.writer == nil {
-		err := c.writeResponse()
-		if err != nil {
-			return err
-		}
-	}
-	return c.writer.WriteBuffer(buffer)
 }
