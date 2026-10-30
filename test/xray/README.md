@@ -4,7 +4,8 @@ Checks the server against the VMess client encoding of Xray-core, which
 v2rayN and most Xray based clients use, with request options set the way
 Xray's outbound sets them. Covers every security type, global padding,
 authenticated length, TCP and UDP, response shaping, and the fallback taken
-by a request rejected for missing encryption.
+by a request rejected for missing encryption. A server that reads the input
+one byte at a time also checks Xray headers across arbitrary stream boundaries.
 
 ```sh
 cd test/xray && go test -race .

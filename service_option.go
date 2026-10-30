@@ -14,10 +14,10 @@ func ServiceWithTimeFunc(timeFunc TimeFunc) ServiceOption {
 	}
 }
 
+// Deprecated: all transports now use bounded, incremental header reads.
+// Kept for source compatibility with existing sing-box integrations.
 func ServiceWithDisableHeaderProtection() ServiceOption {
-	return func(service *Service[string]) {
-		service.disableHeaderProtect = true
-	}
+	return func(service *Service[string]) {}
 }
 
 // ServiceWithAuthScanLimit limits, per source address, how many connections

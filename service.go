@@ -8,6 +8,7 @@ import (
 	"crypto/md5"
 	"crypto/sha256"
 	"encoding/binary"
+	"hash/fnv"
 	"io"
 	"net"
 	"sync"
@@ -22,8 +23,6 @@ import (
 	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
-	"github.com/sagernet/sing/common/replay"
-	"github.com/sagernet/sing/common/rw"
 
 	"github.com/gofrs/uuid/v5"
 )
@@ -42,24 +41,24 @@ var (
 )
 
 type Service[U comparable] struct {
-	users                atomic.Pointer[userTable[U]]
-	sources              *sourceCache
-	cacheClock           func() int64
-	replayFilter         replay.Filter
-	handler              Handler
-	time                 func() time.Time
-	disableHeaderProtect bool
-	handshakeTimeout     time.Duration
-	fallbackHandler      N.TCPConnectionHandlerEx
-	requireEncryption    bool
-	responseShaping      *ResponseShapingOptions
-	drainCount           atomic.Int32
-	legacyAccess         sync.Mutex
-	alterIds             map[U]legacyUser
-	alterIdUpdateTime    map[U]int64
-	alterIdMap           atomic.Pointer[map[[16]byte]legacyUserEntry[U]]
-	alterIdUpdateTask    *time.Ticker
-	alterIdUpdateDone    chan struct{}
+	users             atomic.Pointer[userTable[U]]
+	sources           *sourceCache
+	cacheClock        func() int64
+	replayFilter      serviceReplayFilter
+	handler           Handler
+	time              func() time.Time
+	handshakeTimeout  time.Duration
+	fallbackHandler   N.TCPConnectionHandlerEx
+	requireEncryption bool
+	responseShaping   *ResponseShapingOptions
+	drainCount        atomic.Int32
+	legacyAccess      sync.Mutex
+	alterIds          map[U]legacyUser
+	alterIdUpdateTime map[U]int64
+	alterIdMap        atomic.Pointer[map[[16]byte]legacyUserEntry[U]]
+	alterIdUpdateTask *time.Ticker
+	alterIdUpdateDone chan struct{}
+	legacyStarted     bool
 }
 
 type legacyUser struct {
@@ -86,7 +85,6 @@ const (
 
 func NewService[U comparable](handler Handler, options ...ServiceOption) *Service[U] {
 	service := &Service[U]{
-		replayFilter:     replay.NewSimple(time.Second * 120),
 		handler:          handler,
 		time:             time.Now,
 		handshakeTimeout: -1,
@@ -155,6 +153,7 @@ func (s *Service[U]) UpdateUsers(userList []U, userIdList []string, alterIdList 
 	s.alterIds = userAlterIds
 	s.alterIdUpdateTime = make(map[U]int64)
 	s.generateLegacyKeys()
+	s.startLegacyUpdatesLocked()
 	s.legacyAccess.Unlock()
 	s.users.Store(table)
 	return nil
@@ -173,32 +172,52 @@ func (s *Service[U]) Contains(user U) bool {
 }
 
 func (s *Service[U]) Start() error {
-	const updateInterval = 10 * time.Second
-	if table := s.users.Load(); table != nil && table.legacy {
-		s.alterIdUpdateTask = time.NewTicker(updateInterval)
-		s.alterIdUpdateDone = make(chan struct{})
-		go s.loopGenerateLegacyKeys()
-	}
+	s.legacyAccess.Lock()
+	defer s.legacyAccess.Unlock()
+	s.legacyStarted = true
+	s.startLegacyUpdatesLocked()
 	return nil
 }
 
 func (s *Service[U]) Close() error {
+	s.legacyAccess.Lock()
+	defer s.legacyAccess.Unlock()
+	s.legacyStarted = false
 	if s.alterIdUpdateTask != nil {
 		s.alterIdUpdateTask.Stop()
 		close(s.alterIdUpdateDone)
+		s.alterIdUpdateTask = nil
 	}
 	return nil
 }
 
-func (s *Service[U]) loopGenerateLegacyKeys() {
+// Call under legacyAccess. Users may arrive after Start, so UpdateUsers must
+// also start refreshing the legacy authentication IDs when they become needed.
+func (s *Service[U]) startLegacyUpdatesLocked() {
+	if !s.legacyStarted || s.alterIdUpdateTask != nil || len(s.alterIds) == 0 {
+		return
+	}
+	task := time.NewTicker(10 * time.Second)
+	done := make(chan struct{})
+	s.alterIdUpdateTask, s.alterIdUpdateDone = task, done
+	go s.loopGenerateLegacyKeys(task, done)
+}
+
+func (s *Service[U]) loopGenerateLegacyKeys(task *time.Ticker, done <-chan struct{}) {
 	for {
 		select {
-		case <-s.alterIdUpdateDone:
+		case <-done:
 			return
-		case <-s.alterIdUpdateTask.C:
+		case <-task.C:
 		}
 		s.legacyAccess.Lock()
-		s.generateLegacyKeys()
+		if s.alterIdUpdateTask != task {
+			s.legacyAccess.Unlock()
+			return
+		}
+		if len(s.alterIds) > 0 {
+			s.generateLegacyKeys()
+		}
 		s.legacyAccess.Unlock()
 	}
 }
@@ -235,9 +254,8 @@ func (s *Service[U]) generateLegacyKeys() {
 // NewConnection authenticates conn. Every request it cannot serve, for any
 // reason, gets the same treatment: the bytes read so far are replayed to the
 // fallback handler, or without one the connection is drained until the peer
-// closes or the handshake deadline passes. A prober therefore cannot tell bad
-// keys, replays, stale timestamps or malformed headers apart, and the reply
-// never depends on how many bytes it sent.
+// closes or the handshake deadline passes. Failure reasons do not select
+// different replies; the fallback service determines the observable behavior.
 func (s *Service[U]) NewConnection(ctx context.Context, conn net.Conn, source M.Socksaddr, onClose N.CloseHandlerFunc) error {
 	// Not deferred: on rejection the buffer may be handed to the fallback.
 	requestBuffer := buf.New()
@@ -284,40 +302,30 @@ type serverRequest struct {
 // requestBuffer, so on error it can be rewound and replayed.
 func (s *Service[U]) handshake(ctx context.Context, conn net.Conn, source M.Socksaddr, requestBuffer *buf.Buffer) (context.Context, *serverRequest, error) {
 	const headerLenBufferLen = 2 + CipherOverhead
-	const aeadMinHeaderLen = 16 + headerLenBufferLen + 8 + CipherOverhead + 42
 	table := s.users.Load()
-	minHeaderLen := aeadMinHeaderLen
-	if table != nil && table.legacy {
-		minHeaderLen = 16 + 38
-	}
-
-	if !s.disableHeaderProtect {
-		n, err := requestBuffer.ReadOnceFrom(conn)
-		if err != nil {
-			return ctx, nil, err
-		}
-		if n < minHeaderLen {
-			return ctx, nil, ErrBadHeader
-		}
-	} else {
-		_, err := requestBuffer.ReadAtLeastFrom(conn, minHeaderLen)
-		if err != nil {
-			return ctx, nil, err
-		}
+	// TCP and the outer transports are streams. A short read is not an invalid
+	// header. Once 16 bytes are available, unknown users can fall back without
+	// waiting for a full VMess header (ordinary HTTP requests stay responsive).
+	if _, err := requestBuffer.ReadAtLeastFrom(conn, 16); err != nil {
+		return ctx, nil, err
 	}
 
 	authId := requestBuffer.To(16)
+	var replayID [16]byte
+	copy(replayID[:], authId)
+	var requestTimestamp int64
 	var user U
 	var cmdKey [16]byte
 	var found bool
 	if table != nil {
 		entry, decodedId := s.matchAuthID(table, authId, source.Addr, s.cacheClock())
 		if entry != nil {
-			timestamp := int64(binary.BigEndian.Uint64(decodedId[:]))
-			if diff := timestamp - s.time().Unix(); diff > 120 || diff < -120 {
+			requestTimestamp = int64(binary.BigEndian.Uint64(decodedId[:]))
+			now := s.time().Unix()
+			if !validRequestTimestamp(requestTimestamp, now) {
 				return ctx, nil, ErrBadTimestamp
 			}
-			if !s.replayFilter.Check(decodedId[:]) {
+			if s.replayFilter.contains(replayID, now) {
 				return ctx, nil, ErrReplay
 			}
 			user = entry.user
@@ -337,21 +345,30 @@ func (s *Service[U]) handshake(ctx context.Context, conn net.Conn, source M.Sock
 			user = currUser.User
 			cmdKey = currUser.CmdKey
 			legacyTimestamp = uint64(currUser.Time)
+			requestTimestamp = currUser.Time
+			if !validRequestTimestamp(requestTimestamp, s.time().Unix()) {
+				return ctx, nil, ErrBadTimestamp
+			}
 		}
 	}
 	if !found {
 		return ctx, nil, ErrBadRequest
 	}
 
-	ctx = auth.ContextWithUser(ctx, user)
 	var headerReader io.Reader
 	var headerBuffer []byte
+	var legacyHeader bytes.Buffer
+	var legacyInput *headerRecordingReader
 
 	var reader io.Reader
 	var err error
 	if legacyProtocol {
 		requestBuffer.Advance(16)
-		reader = io.MultiReader(bytes.NewReader(requestBuffer.Bytes()), conn)
+		// The initial read may include body data. Own that data before the
+		// request buffer is released, and record later raw header reads so a
+		// fragmented invalid request is replayed to the website in full.
+		legacyInput = &headerRecordingReader{reader: conn, buffer: requestBuffer}
+		reader = io.MultiReader(bytes.NewReader(append([]byte(nil), requestBuffer.Bytes()...)), legacyInput)
 
 		timeHash := md5.New()
 		common.Must(binary.Write(timeHash, binary.BigEndian, legacyTimestamp))
@@ -362,16 +379,21 @@ func (s *Service[U]) handshake(ctx context.Context, conn net.Conn, source M.Sock
 		headerBuffer = make([]byte, 38)
 		_, err = io.ReadFull(headerReader, headerBuffer)
 		if err != nil {
-			return ctx, nil, E.Extend(ErrBadHeader, io.ErrShortBuffer)
+			return ctx, nil, err
 		}
+		legacyHeader.Write(headerBuffer)
+		headerReader = io.TeeReader(headerReader, &legacyHeader)
 	} else {
-		if requestBuffer.Len() < aeadMinHeaderLen {
-			return ctx, nil, ErrBadHeader
+		const nonceIndex = 16 + headerLenBufferLen
+		const headerIndex = nonceIndex + 8
+		if needRead := headerIndex - requestBuffer.Len(); needRead > 0 {
+			if _, err := requestBuffer.ReadFullFrom(conn, needRead); err != nil {
+				return ctx, nil, err
+			}
 		}
 
 		reader = conn
 
-		const nonceIndex = 16 + headerLenBufferLen
 		connectionNonce := requestBuffer.Range(nonceIndex, nonceIndex+8)
 
 		lengthKey := KDF(cmdKey[:], KDFSaltConstVMessHeaderPayloadLengthAEADKey, authId, connectionNonce)[:16]
@@ -382,7 +404,6 @@ func (s *Service[U]) handshake(ctx context.Context, conn net.Conn, source M.Sock
 			return ctx, nil, err
 		}
 
-		const headerIndex = nonceIndex + 8
 		headerLength := int(binary.BigEndian.Uint16(lengthBuffer))
 		needRead := headerLength + headerIndex + CipherOverhead - requestBuffer.Len()
 		if needRead > 0 {
@@ -448,19 +469,49 @@ func (s *Service[U]) handshake(ctx context.Context, conn net.Conn, source M.Sock
 			return ctx, nil, E.Extend(ErrBadHeader, "bad padding")
 		}
 	}
-	err = rw.SkipN(headerReader, 4)
-	if err != nil {
+	var checksum [4]byte
+	if _, err = io.ReadFull(headerReader, checksum[:]); err != nil {
 		return ctx, nil, err
 	}
+	if legacyProtocol {
+		hash := fnv.New32a()
+		hash.Write(legacyHeader.Bytes()[:legacyHeader.Len()-4])
+		if hash.Sum32() != binary.BigEndian.Uint32(checksum[:]) {
+			return ctx, nil, ErrInvalidChecksum
+		}
+	}
+	if s.requireEncryption && (security == SecurityTypeNone || security == SecurityTypeLegacy) {
+		return ctx, nil, E.New("unauthenticated security type rejected: ", security)
+	}
+	if legacyProtocol {
+		// Legacy clients reuse their authentication ID within a second. Claim
+		// the complete verified header instead, scoped to user and timestamp,
+		// so fresh connections in that second remain compatible. This blocks
+		// exact replays; it does not make the legacy construction an AEAD.
+		hash := sha256.New()
+		hash.Write([]byte("VMess legacy replay"))
+		hash.Write(cmdKey[:])
+		binary.Write(hash, binary.BigEndian, legacyTimestamp)
+		hash.Write(legacyHeader.Bytes())
+		copy(replayID[:], hash.Sum(nil))
+	}
+	now := s.time().Unix()
+	if !validRequestTimestamp(requestTimestamp, now) {
+		return ctx, nil, ErrBadTimestamp
+	}
+	if !s.replayFilter.check(replayID, requestTimestamp+CacheDurationSeconds, now) {
+		return ctx, nil, ErrReplay
+	}
+	if legacyInput != nil {
+		legacyInput.buffer = nil
+	}
+	ctx = auth.ContextWithUser(ctx, user)
 	if !legacyProtocol && requestBuffer.Len() > 0 {
 		reader = bufio.NewCachedReader(reader, requestBuffer.ToOwned())
 	}
 	reader = CreateReader(reader, nil, requestBodyKey, requestBodyNonce, requestBodyKey, requestBodyNonce, security, option)
 	if option&RequestOptionChunkStream != 0 && command == CommandTCP || command == CommandMux {
 		reader = bufio.NewChunkReader(reader, ReadChunkSize)
-	}
-	if s.requireEncryption && (security == SecurityTypeNone || security == SecurityTypeLegacy) {
-		return ctx, nil, E.New("unauthenticated security type rejected: ", security)
 	}
 	out := &coalescedWriter{upstream: bufio.NewExtendedWriter(conn)}
 	return ctx, &serverRequest{
@@ -478,6 +529,28 @@ func (s *Service[U]) handshake(ctx context.Context, conn net.Conn, source M.Sock
 		command:     command,
 		destination: destination,
 	}, nil
+}
+
+func validRequestTimestamp(timestamp, now int64) bool {
+	return timestamp >= now-CacheDurationSeconds && timestamp <= now+CacheDurationSeconds
+}
+
+// Only enabled while parsing a legacy header. Body reads use the same reader
+// after buffer is cleared, without retaining or modifying application data.
+type headerRecordingReader struct {
+	reader io.Reader
+	buffer *buf.Buffer
+}
+
+func (r *headerRecordingReader) Read(p []byte) (int, error) {
+	if r.buffer != nil && len(p) > r.buffer.FreeLen() {
+		return 0, io.ErrShortBuffer
+	}
+	n, err := r.reader.Read(p)
+	if r.buffer != nil && n > 0 {
+		r.buffer.Write(p[:n])
+	}
+	return n, err
 }
 
 func (s *Service[U]) reject(ctx context.Context, conn net.Conn, source M.Socksaddr, request *buf.Buffer, deadline time.Time, err error, onClose N.CloseHandlerFunc) error {

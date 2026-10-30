@@ -61,6 +61,22 @@ func (h *echoHandler) NewPacketConnectionEx(ctx context.Context, conn N.PacketCo
 }
 
 func newServer(t *testing.T, options ...vmess.ServiceOption) (string, *echoHandler, []string) {
+	return newServerWithReadSize(t, 0, options...)
+}
+
+type limitedReadConn struct {
+	net.Conn
+	size int
+}
+
+func (c *limitedReadConn) Read(p []byte) (int, error) {
+	if len(p) > c.size {
+		p = p[:c.size]
+	}
+	return c.Conn.Read(p)
+}
+
+func newServerWithReadSize(t *testing.T, readSize int, options ...vmess.ServiceOption) (string, *echoHandler, []string) {
 	t.Helper()
 	handler := &echoHandler{users: make(chan int, 64)}
 	service := vmess.NewService[int](handler, options...)
@@ -86,6 +102,9 @@ func newServer(t *testing.T, options ...vmess.ServiceOption) (string, *echoHandl
 				return
 			}
 			go func() {
+				if readSize > 0 {
+					conn = &limitedReadConn{Conn: conn, size: readSize}
+				}
 				if err := service.NewConnection(context.Background(), conn, M.SocksaddrFromNet(conn.RemoteAddr()), nil); err != nil {
 					conn.Close()
 				}
@@ -93,6 +112,21 @@ func newServer(t *testing.T, options ...vmess.ServiceOption) (string, *echoHandl
 		}
 	}()
 	return listener.Addr().String(), handler, ids
+}
+
+func TestXrayFragmentedHeaders(t *testing.T) {
+	addr, handler, ids := newServerWithReadSize(t, 1, vmess.ServiceWithResponseShaping(vmess.ResponseShapingOptions{}))
+	for name, security := range securities {
+		t.Run(name, func(t *testing.T) {
+			s := dial(t, addr, newRequest(ids[1], security, protocol.RequestCommandTCP, false), []byte("fragmented xray"))
+			if got := <-handler.users; got != 1 {
+				t.Fatalf("authenticated as %d", got)
+			}
+			if got := s.read(t, len("fragmented xray")); string(got) != "fragmented xray" {
+				t.Fatalf("corrupt reply: %q", got)
+			}
+		})
+	}
 }
 
 // newRequest mirrors proxy/vmess/outbound of Xray-core.

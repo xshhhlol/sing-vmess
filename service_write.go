@@ -62,7 +62,10 @@ func (w *coalescedWriter) writePending() error {
 	if len(w.pending) == 0 {
 		return nil
 	}
-	_, err := w.upstream.Write(w.pending)
+	n, err := w.upstream.Write(w.pending)
+	if err == nil && n != len(w.pending) {
+		err = io.ErrShortWrite
+	}
 	if cap(w.pending) > coalesceLimit*2 {
 		w.pending = nil
 	} else {
@@ -72,10 +75,10 @@ func (w *coalescedWriter) writePending() error {
 }
 
 // ResponseShapingOptions splits the first downlink data of a TCP request into
-// records of random size, so the nested TLS handshake of the proxied
-// connection does not show its usual record lengths. Only the server changes;
-// clients read the same byte stream. Each extra record costs one chunk header
-// and tag. Uplink and the total size of a burst are not changed.
+// records of random size. Only the server changes; clients read the same
+// application byte stream. Each extra record costs a chunk header and tag
+// (and negotiated padding). This does not hide uplink, burst sizes, timing or
+// direction, and writes need not map one-to-one to TCP segments or TLS records.
 type ResponseShapingOptions struct {
 	MinRecordSize int // Default: 256 payload bytes.
 	MaxRecordSize int // Default: 1400; maximum: WriteChunkSize.
@@ -164,7 +167,11 @@ func (c *rawServerConn) write(p []byte) (n int, err error) {
 			size = c.shaper.next(size)
 		}
 		c.out.hold()
-		_, err = c.writer.Write(p[:size])
+		var written int
+		written, err = c.writer.Write(p[:size])
+		if err == nil && written != size {
+			err = io.ErrShortWrite
+		}
 		if flushErr := c.out.flush(); err == nil {
 			err = flushErr
 		}

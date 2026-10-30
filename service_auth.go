@@ -145,7 +145,9 @@ func (c *sourceCache) remember(addr netip.Addr, hint uint64, now int64) {
 	state.hints[0] = hint
 }
 
-// allowScan reports whether addr still has budget for failed full scans.
+// allowScan reserves a token before scanning, under the same lock as the
+// budget check. Concurrent failures cannot all spend the same last token.
+// Successful scans refund their reservation.
 func (c *sourceCache) allowScan(addr netip.Addr, now int64) bool {
 	if c.burst <= 0 {
 		return true
@@ -159,17 +161,24 @@ func (c *sourceCache) allowScan(addr netip.Addr, now int64) bool {
 		state.tokens = c.burst
 	}
 	state.refillAt = now
-	return state.tokens >= 1
+	if state.tokens < 1 {
+		return false
+	}
+	state.tokens--
+	return true
 }
 
-func (c *sourceCache) scanFailed(addr netip.Addr, now int64) {
+func (c *sourceCache) scanSucceeded(addr netip.Addr, now int64) {
 	if c.burst <= 0 {
 		return
 	}
 	shard := c.shard(addr)
 	shard.access.Lock()
 	defer shard.access.Unlock()
-	c.get(shard, addr, now).tokens--
+	state := c.get(shard, addr, now)
+	if state.tokens < c.burst {
+		state.tokens++
+	}
 }
 
 func sourceAddr(addr netip.Addr) (netip.Addr, bool) {
@@ -197,13 +206,11 @@ func (s *Service[U]) matchAuthID(table *userTable[U], authID []byte, source neti
 	for i := range table.entries {
 		if table.entries[i].decodeAuthID(&decoded, authID) {
 			if cached {
+				s.sources.scanSucceeded(addr, now)
 				s.sources.remember(addr, keyHint(table.entries[i].cmdKey), now)
 			}
 			return &table.entries[i], decoded
 		}
-	}
-	if cached {
-		s.sources.scanFailed(addr, now)
 	}
 	return nil, decoded
 }
